@@ -60,19 +60,19 @@ typedef struct _PAGING_STRUCTURES
     //
     // There is only one PML4, unless 5-level page mapping is enabled.
     //
-    DECLSPEC_ALIGN(PAGE_SIZE) PML4E_64 Pml4[PML4_ENTRY_COUNT];
+    DECLSPEC_ALIGN(PAGE_SIZE) PML4E_64 Pml4[PML4E_ENTRY_COUNT_64];
 
     //
     // Only one PDPT is used for PML4[0]. This covers 512GB of the physical memory
     // range and is sufficient for our purpose.
     //
-    DECLSPEC_ALIGN(PAGE_SIZE) PDPTE_64 Pdpt[1][PDPT_ENTRY_COUNT];
+    DECLSPEC_ALIGN(PAGE_SIZE) PDPTE_64 Pdpt[1][PDPTE_ENTRY_COUNT_64];
 
     //
     // PDs are assigned for each PDPT entry, meaning that 512 (PDPTEs) multiplied
     // by the PDT entry count.
     //
-    DECLSPEC_ALIGN(PAGE_SIZE) PDE_2MB_64 Pdt[1][PDPT_ENTRY_COUNT][PDT_ENTRY_COUNT];
+    DECLSPEC_ALIGN(PAGE_SIZE) PDE_2MB_64 Pdt[1][PDPTE_ENTRY_COUNT_64][PDE_ENTRY_COUNT_64];
 } PAGING_STRUCTURES;
 
 //
@@ -123,7 +123,7 @@ InitializeHostPagingStructures (
     pml4[0].Write = TRUE;
     pml4[0].PageFrameNumber = GetPhysicalAddress(pdpt) >> PAGE_SHIFT;
 
-    for (UINT32 pdptIndex = 0; pdptIndex < PDPT_ENTRY_COUNT; ++pdptIndex)
+    for (UINT32 pdptIndex = 0; pdptIndex < PDPTE_ENTRY_COUNT_64; ++pdptIndex)
     {
         pdt = g_HostPagingStructures.Pdt[pml4Index][pdptIndex];
 
@@ -131,7 +131,7 @@ InitializeHostPagingStructures (
         pdpt[pdptIndex].Write = TRUE;
         pdpt[pdptIndex].PageFrameNumber = GetPhysicalAddress(pdt) >> PAGE_SHIFT;
 
-        for (UINT32 pdIndex = 0; pdIndex < PDT_ENTRY_COUNT; ++pdIndex)
+        for (UINT32 pdIndex = 0; pdIndex < PDE_ENTRY_COUNT_64; ++pdIndex)
         {
             UINT64 physicalAddress;
 
@@ -156,8 +156,7 @@ InitializeHostPagingStructures (
     @brief Initializes the host IDT.
 
     @details This function fills out the IDT with AsmDefaultExceptionHandlers[N]
-        where N is the interrupt number, updates IDT[2] with AsmNmiExceptionHandler,
-        and initializes IDTR to point to the IDT.
+        where N is the interrupt number and initializes IDTR to point to the IDT.
 
         AsmDefaultExceptionHandlers is the array of stub functions to transfer
         execution to the main common logic in AsmCommonExceptionHandler.
@@ -208,13 +207,6 @@ InitializeHostIdt (
         g_HostIdt[i].SegmentSelector = AsmReadCs();
         g_HostIdt[i].GateType = 0x8E;
     }
-
-    //
-    // Interrupt 0x2 is NMI. This needs special handling.
-    //
-    g_HostIdt[2].Offset15To0 = (UINT16)((UINT64)&AsmNmiExceptionHandler);
-    g_HostIdt[2].Offset31To16 = (UINT16)((UINT64)&AsmNmiExceptionHandler >> 16);
-    g_HostIdt[2].Offset63To32 = (UINT32)((UINT64)&AsmNmiExceptionHandler >> 32);
 
     //
     // Finally initialize the IDTR to point to the IDT.
@@ -328,4 +320,45 @@ CleanupGdt (
 {
     MV_ASSERT(OriginalGdtr->BaseAddress != 0);
     _lgdt((VOID*)OriginalGdtr);
+}
+
+BOOLEAN
+IsVmxAvailableEx (
+    )
+{
+    BOOLEAN vmxAvailable;
+    IA32_VMX_MISC_REGISTER vmxMiscMsr;
+
+    vmxAvailable = FALSE;
+
+    //
+    // We need "unrestricted guest" and this bit indicates availability of it.
+    //
+    vmxMiscMsr.Flags = __readmsr(IA32_VMX_MISC);
+    if (vmxMiscMsr.StoreEferLmaOnVmexit == FALSE)
+    {
+        LOG_ERROR("Missing required misc feature(s) : %016llx", vmxMiscMsr.Flags);
+        goto Exit;
+    }
+
+    //
+    // We requires support of the wait-for-SIPI state on a MP system. Some VM like
+    // QEMU+KVM does not support this. Checked only on the BPS once.
+    //
+    // "Bit 8 reports (if set) the support for activity state 3 (wait-for-SIPI)."
+    // See: A.6 MISCELLANEOUS DATA
+    //
+    if ((GetCurrentProcessorNumber() == 0) &&
+        (GetActiveProcessorCount() > 1) &&
+        !BooleanFlagOn(vmxMiscMsr.ActivityStates, 1 << 2))
+    {
+        LOG_ERROR("Missing required multi processor related feature: %016llx", vmxMiscMsr.Flags);
+        LOG_ERROR("Configure the system to be a single processor.");
+        goto Exit;
+    }
+
+    vmxAvailable = TRUE;
+
+Exit:
+    return vmxAvailable;
 }

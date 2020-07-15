@@ -1,7 +1,7 @@
 [Defines]
   INF_VERSION                    = 1.27
   BASE_NAME                      = MiniVisorDxe
-  FILE_GUID                      = 503682AC-F01E-4D10-AAE3-BE5A90A563E7
+  FILE_GUID                      = 431B242C-8D1B-497F-AC69-352BB4713525
   MODULE_TYPE                    = DXE_RUNTIME_DRIVER
   VERSION_STRING                 = 1.0
   ENTRY_POINT                    = DriverEntry
@@ -45,7 +45,7 @@
   ../../../Sources/Asm.asm
   ../../../Sources/Asm.h
   ../../../Sources/Common.h
-  ../../../Sources/ia32-doc/out/ia32.h
+  ../../../Externals/ia32-doc/out/ia32.h
 
 [Packages]
   MdePkg/MdePkg.dec
@@ -65,7 +65,6 @@
 
 [Guids]
   gEfiEventExitBootServicesGuid                    ## CONSUMES
-  gEfiEventVirtualAddressChangeGuid                ## CONSUMES
 
 [Depex]
   TRUE
@@ -87,6 +86,9 @@
   # for example, to reconstruct stack trace. Leave it for such cases. See also,
   # https://edk2-docs.gitbooks.io/edk-ii-basetools-user-guides/content/GenFw.html
   MSFT:*_*_X64_GENFW_FLAGS = --keepexceptiontable --keepzeropending --keepoptionalheader
+
+  # gcc and clang is not supported but this let us run additional code analysis.
+  GCC:*_*_*_CC_FLAGS = -Wall -Wextra -Wno-unknown-pragmas -Wno-multichar -Wno-unused-function -Wno-unused-value -Wno-unused-parameter
 
   # Finally, note that the RELEASE build will generate excessively large binary
   # file. To avoid this open the Conf/tools_def.txt, locate the below line,

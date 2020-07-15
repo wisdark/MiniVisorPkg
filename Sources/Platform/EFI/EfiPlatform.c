@@ -209,10 +209,22 @@ InitializePlatform (
     //
     status = gBS->LocateProtocol(&gEfiMpServiceProtocolGuid,
                                  NULL,
-                                 &g_MpServices);
+                                 (void**)&g_MpServices);
     if (EFI_ERROR(status))
     {
         LOG_ERROR("LocateProtocol failed : %r", status);
+
+        //
+        // As there is no way to work with APs on this system, MiniVisor only
+        // virtualizes the current processor. This can result in non-uniformed
+        // system configuration and cause boot failure. For example the
+        // MULTIPROCESSOR_CONFIGURATION_NOT_SUPPORTED bug check occurs if our
+        // hypervisor modifies the results of the CPUID instruction.
+        //
+        LOG_WARNING("Configure the system to be a single processor.");
+        LOG_WARNING("MiniVisor will virtualize only the boot strap processor.");
+        LOG_WARNING("This may result in operating system startup failure.");
+        status = EFI_SUCCESS;
         goto Exit;
     }
 
@@ -242,11 +254,21 @@ GetActiveProcessorCount (
     UINTN numberOfProcessors;
     UINTN numberOfEnabledProcessors;
 
+    //
+    // On the system that does not support the MP protocol, we only virtualize
+    // the BSP and pretend that the system has a single core.
+    //
+    if (g_MpServices == NULL)
+    {
+        return 1;
+    }
+
     status = g_MpServices->GetNumberOfProcessors(g_MpServices,
                                                  &numberOfProcessors,
                                                  &numberOfEnabledProcessors);
     if (EFI_ERROR(status))
     {
+        LOG_ERROR("GetNumberOfProcessors failed : %r", status);
         MV_PANIC();
     }
 
@@ -260,9 +282,19 @@ GetCurrentProcessorNumber (
     EFI_STATUS status;
     UINTN processorNumber;
 
+    //
+    // On the system that does not support the MP protocol, we only virtualize
+    // the BSP and pretend that the system has a single core.
+    //
+    if (g_MpServices == NULL)
+    {
+        return 0;
+    }
+
     status = g_MpServices->WhoAmI(g_MpServices, &processorNumber);
     if (EFI_ERROR(status))
     {
+        LOG_ERROR("WhoAmI failed : %r", status);
         MV_PANIC();
     }
 
@@ -352,7 +384,7 @@ RunOnAllProcessors (
     }
 
     status = g_MpServices->StartupAllAPs(g_MpServices,
-                                         Callback,
+                                         (EFI_AP_PROCEDURE)Callback,
                                          TRUE,
                                          NULL,
                                          0,
@@ -360,6 +392,7 @@ RunOnAllProcessors (
                                          NULL);
     if (EFI_ERROR(status))
     {
+        LOG_ERROR("StartupAllAPs failed : %r", status);
         MV_PANIC();
     }
 

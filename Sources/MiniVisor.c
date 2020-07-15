@@ -213,6 +213,19 @@ AdjustControlValue (
     //
     effectiveValue |= capabilities.Allowed0Settings;
     effectiveValue &= capabilities.Allowed1Settings;
+
+    //
+    // Log if not all requested bits are enabled. This can be fatal but let it run
+    // and see what happens.
+    //
+    if ((effectiveValue & RequestedValue) != RequestedValue)
+    {
+        LOG_WARNING("Not all the requested VM control fields are enabled.");
+        LOG_WARNING("MSR %08x: Requested %08x, Effective %08x",
+                    VmxCapabilityMsr,
+                    RequestedValue,
+                    effectiveValue);
+    }
     return effectiveValue;
 }
 
@@ -363,20 +376,11 @@ BOOLEAN
 IsMiniVisorInstalled (
     )
 {
-    int registers[4];   // EAX, EBX, ECX, and EDX
-    char vendorId[13];
-
     //
     // When our hypervisor is installed, CPUID leaf 40000000h will return
     // "MiniVisor   " as the vendor name.
     //
-    __cpuid(registers, CPUID_HV_VENDOR_AND_MAX_FUNCTIONS);
-    RtlCopyMemory(vendorId + 0, &registers[1], sizeof(registers[1]));
-    RtlCopyMemory(vendorId + 4, &registers[2], sizeof(registers[2]));
-    RtlCopyMemory(vendorId + 8, &registers[3], sizeof(registers[3]));
-    vendorId[12] = ANSI_NULL;
-
-    return (strcmp(vendorId, "MiniVisor   ") == 0);
+    return IsHypervisorPresent("MiniVisor   ");
 }
 
 /*!
@@ -408,7 +412,7 @@ DisableHypervisor (
     // Issues the hypercall to uninstall the hypervisor. This hypercall returns
     // the address of the shared processor context on success.
     //
-    returnedAddress = (SHARED_PROCESSOR_CONTEXT*)AsmVmxCall(VmcallUninstall, 0, 0, 0);
+    returnedAddress = (SHARED_PROCESSOR_CONTEXT*)AsmVmxCall(MV_VMCALL_UNINSTALL, 0, 0, 0);
     MV_ASSERT(returnedAddress != NULL);
 
     //
@@ -541,11 +545,14 @@ IsVmxAvailable (
         (eptVpidCapabilityMsr.InvvpidSingleContext == FALSE) ||
         (eptVpidCapabilityMsr.InvvpidAllContexts == FALSE))
     {
-        LOG_ERROR("EPT is not supported.");
+        LOG_ERROR("EPT is not supported : %016llx", eptVpidCapabilityMsr.Flags);
         goto Exit;
     }
 
-    vmxAvailable = TRUE;
+    //
+    // Finally, check the platform specific requirements.
+    //
+    vmxAvailable = IsVmxAvailableEx();
 
 Exit:
     return vmxAvailable;
@@ -814,9 +821,13 @@ SetupVmcs (
 
     //
     // The pin-based VM-execution controls governs the handling of asynchronous
-    // events (for example: interrupts). We do not need any of them.
+    // events (for example: interrupts). We need to enable those two NMI related
+    // flags in order to use NMI-window exiting, which is required to inject NMI
+    // occurs during execution of the host.
     //
     pinBasedControls.Flags = 0;
+    pinBasedControls.NmiExiting = TRUE;
+    pinBasedControls.VirtualNmi = TRUE;
     AdjustPinBasedControls(&pinBasedControls);
 
     //
@@ -866,20 +877,13 @@ SetupVmcs (
     //  RPL (bits 1:0) and the TI flag (bit 2) must be 0"
     // See: 26.2.3 Checks on Host Segment and Descriptor-Table Registers
     //
-    MV_ASSERT(FlagOn(AsmReadEs(), hostSegmentSelectorMask) == FALSE);
-    MV_ASSERT(FlagOn(AsmReadCs(), hostSegmentSelectorMask) == FALSE);
-    MV_ASSERT(FlagOn(AsmReadSs(), hostSegmentSelectorMask) == FALSE);
-    MV_ASSERT(FlagOn(AsmReadDs(), hostSegmentSelectorMask) == FALSE);
-    MV_ASSERT(FlagOn(AsmReadFs(), hostSegmentSelectorMask) == FALSE);
-    MV_ASSERT(FlagOn(AsmReadGs(), hostSegmentSelectorMask) == FALSE);
-    MV_ASSERT(FlagOn(AsmReadTr(), hostSegmentSelectorMask) == FALSE);
-    VmxWrite(VMCS_HOST_ES_SELECTOR, AsmReadEs());
-    VmxWrite(VMCS_HOST_CS_SELECTOR, AsmReadCs());
-    VmxWrite(VMCS_HOST_SS_SELECTOR, AsmReadSs());
-    VmxWrite(VMCS_HOST_DS_SELECTOR, AsmReadDs());
-    VmxWrite(VMCS_HOST_FS_SELECTOR, AsmReadFs());
-    VmxWrite(VMCS_HOST_GS_SELECTOR, AsmReadGs());
-    VmxWrite(VMCS_HOST_TR_SELECTOR, AsmReadTr());
+    VmxWrite(VMCS_HOST_ES_SELECTOR, AsmReadEs() & ~hostSegmentSelectorMask);
+    VmxWrite(VMCS_HOST_CS_SELECTOR, AsmReadCs() & ~hostSegmentSelectorMask);
+    VmxWrite(VMCS_HOST_SS_SELECTOR, AsmReadSs() & ~hostSegmentSelectorMask);
+    VmxWrite(VMCS_HOST_DS_SELECTOR, AsmReadDs() & ~hostSegmentSelectorMask);
+    VmxWrite(VMCS_HOST_FS_SELECTOR, AsmReadFs() & ~hostSegmentSelectorMask);
+    VmxWrite(VMCS_HOST_GS_SELECTOR, AsmReadGs() & ~hostSegmentSelectorMask);
+    VmxWrite(VMCS_HOST_TR_SELECTOR, AsmReadTr() & ~hostSegmentSelectorMask);
 
     /* 64-Bit Host-State Fields */
     VmxWrite(VMCS_HOST_EFER, __readmsr(IA32_EFER));
@@ -1187,14 +1191,14 @@ InitializeMsrBitmaps (
 
     static CONST INTERCEPT_MSR_REGISTRATION registrations[] =
     {
-        { IA32_BIOS_SIGN_ID, OperationRead, },
+        { IA32_BIOS_UPDATE_SIGNATURE, OperationRead, },
     };
 
     PAGED_CODE();
 
     RtlZeroMemory(Bitmaps, sizeof(*Bitmaps));
 
-    for (int i = 0; i < RTL_NUMBER_OF(registrations); ++i)
+    for (UINT64 i = 0; i < RTL_NUMBER_OF(registrations); ++i)
     {
         UpdateMsrBitmaps(Bitmaps,
                          registrations[i].Msr,

@@ -14,6 +14,8 @@
 #include "ExtendedPageTables.h"
 #include "HostVmcall.h"
 #include "HostNesting.h"
+#include "Asm.h"
+#include "Ia32Utils.h"
 
 //
 // Windows-specific:
@@ -74,7 +76,7 @@ HandleMsrAccess (
     {
         switch (msr)
         {
-        case IA32_BIOS_SIGN_ID:
+        case IA32_BIOS_UPDATE_SIGNATURE:
             //
             // Linux reads this MSR during boot and may attempt to update BIOS
             // microcode. Returning the greater value than the value the kernel
@@ -183,15 +185,6 @@ HandleCpuid (
             registers[3] = '   r';
             break;
 
-        case CPUID_HV_INTERFACE:
-            //
-            // Return non Hv#1 value. This indicate that the MiniVisor does NOT
-            // conform to the Microsoft hypervisor interface.
-            //
-            registers[0] = '0#vH';  // Hv#0
-            registers[1] = registers[2] = registers[3] = 0;
-            break;
-
         default:
             break;
     }
@@ -210,6 +203,10 @@ HandleCpuid (
 /*!
     @brief Handles VM-exit due to execution of the VMCALL instruction.
 
+    @details When this hypervisor run on Hyper-V, VMCALLs that are issued for
+        Hyper-V is delivered in this hypervisor. If this appears to be the case,
+        this function re-issue VMCALL so it is forwarded to Hyper-V.
+
     @param[in,out] GuestContext - The pointer to the guest context.
  */
 static
@@ -224,7 +221,37 @@ HandleVmCall (
     // Our hypercall takes the hypercall number in RCX.
     //
     hypercallNumber = GuestContext->StackBasedRegisters->Rcx;
-    if (hypercallNumber >= VmcallInvalid)
+
+    //
+    // This hypercall is not for us if the higher 32bit does not have a signature.
+    //
+    if ((hypercallNumber >> 32) != MV_VMCALL_SIGNATURE_MASK)
+    {
+        //
+        // Let the L0 Hyper-V handle it if it appears to exist. Otherwise, inject
+        // #UD.
+        //
+        if (IsHypervisorPresent("Microsoft Hv") != FALSE)
+        {
+            GuestContext->StackBasedRegisters->Rax = AsmVmxCall(
+                                        GuestContext->StackBasedRegisters->Rcx,
+                                        GuestContext->StackBasedRegisters->Rdx,
+                                        GuestContext->StackBasedRegisters->R8,
+                                        GuestContext->StackBasedRegisters->R9);
+            AdvanceGuestInstructionPointer(GuestContext);
+        }
+        else
+        {
+            InjectInterruption(HardwareException, InvalidOpcode, FALSE, 0);
+        }
+        goto Exit;
+    }
+
+    //
+    // This hypercall may be for us. Check if this is one of accepted numbers.
+    //
+    if ((hypercallNumber <= MV_VMCALL_INVALID_MIN) ||
+        (hypercallNumber >= MV_VMCALL_INVALID_MAX))
     {
         //
         // Undefined hypercall number. Inject #UD.
@@ -236,6 +263,7 @@ HandleVmCall (
     //
     // Executes the corresponding hypercall handler.
     //
+    hypercallNumber &= MAXUINT32;
     k_VmcallHandlers[hypercallNumber](GuestContext);
 
     AdvanceGuestInstructionPointer(GuestContext);
@@ -463,53 +491,68 @@ HandleExceptionOrNmi (
     VMEXIT_INTERRUPT_INFORMATION interruptInfo;
 
     interruptInfo.Flags = (UINT32)VmxRead(VMCS_VMEXIT_INTERRUPTION_INFORMATION);
-    MV_ASSERT(interruptInfo.InterruptionType == HardwareException);
-    MV_ASSERT(interruptInfo.Vector == DivideError);
 
-    //
-    // The below check detects division that will trigger initialization of
-    // PatchGuard. The very instruction is this on all versions of Windows.
-    //  idiv r8d
-    // The IDIV instruction in this form performs (int64)edx:eax / (int32)r8d,
-    // and cases #DE, in particular when a positive result is greater than
-    // 0x7fffffff. If the kernel debugger is not attached and disabled, the NT
-    // kernel executes this instruction with the following values, resulting in
-    // the #DE.
-    //  ((int64)0xffffffff80000000 / -1) => 0x80000000
-    // When this condition is detected for the first time, we do not inject #DE
-    // to the guest to avoid initialization of main PatchGuard logic.
-    //
-    if ((isKeInitAmd64SpecificStateCalled == FALSE) &&
-        ((UINT32)GuestContext->StackBasedRegisters->Rax == (UINT32)0x80000000) &&
-        ((UINT32)GuestContext->StackBasedRegisters->Rdx == (UINT32)0xffffffff) &&
-        ((UINT32)GuestContext->StackBasedRegisters->R8 ==  (UINT32)-1))
+    switch (interruptInfo.Vector)
     {
-        UINT64 ntoskrnlBase;
+    case Nmi:
+        MV_ASSERT(interruptInfo.InterruptionType == NonMaskableInterrupt);
 
         //
-        // Just as an example of how to access the guest virtual address, search
-        // the base address of the NT kernel and print it out.
+        // Enable NMI-window exiting to inject NMI whenever it becomes possible.
         //
-        ntoskrnlBase = FindImageBase(GuestContext, GuestContext->VmcsBasedRegisters.Rip);
-        if (ntoskrnlBase != 0)
+        SetNmiWindowExiting(TRUE);
+        break;
+
+    case DivideError:
+        MV_ASSERT(interruptInfo.InterruptionType == HardwareException);
+
+        //
+        // The below check detects division that will trigger initialization of
+        // PatchGuard. The very instruction is this on all versions of Windows.
+        //  idiv r8d
+        // The IDIV instruction in this form performs (int64)edx:eax / (int32)r8d,
+        // and cases #DE, in particular when a positive result is greater than
+        // 0x7fffffff. If the kernel debugger is not attached and disabled, the NT
+        // kernel executes this instruction with the following values, resulting in
+        // the #DE.
+        //  ((int64)0xffffffff80000000 / -1) => 0x80000000
+        // When this condition is detected for the first time, we do not inject #DE
+        // to the guest to avoid initialization of main PatchGuard logic.
+        //
+        if ((isKeInitAmd64SpecificStateCalled == FALSE) &&
+            ((UINT32)GuestContext->StackBasedRegisters->Rax == (UINT32)0x80000000) &&
+            ((UINT32)GuestContext->StackBasedRegisters->Rdx == (UINT32)0xffffffff) &&
+            ((UINT32)GuestContext->StackBasedRegisters->R8 ==  (UINT32)-1))
         {
-            LOG_INFO("Found ntoskrnl.exe at %016llx", ntoskrnlBase);
+            UINT64 ntoskrnlBase;
+
+            //
+            // Just as an example of how to access the guest virtual address, search
+            // the base address of the NT kernel and print it out.
+            //
+            ntoskrnlBase = FindImageBase(GuestContext, GuestContext->VmcsBasedRegisters.Rip);
+            if (ntoskrnlBase != 0)
+            {
+                LOG_INFO("Found ntoskrnl.exe at %016llx", ntoskrnlBase);
+            }
+
+            LOG_INFO("KeInitAmd64SpecificState triggered #DE");
+            LOG_INFO("Skipping main PatchGuard initialization.");
+            isKeInitAmd64SpecificStateCalled = TRUE;
+            AdvanceGuestInstructionPointer(GuestContext);
         }
+        else
+        {
+            //
+            // Otherwise, just forward the exception.
+            //
+            InjectInterruption(interruptInfo.InterruptionType, interruptInfo.Vector, FALSE, 0);
+        }
+        break;
 
-        LOG_INFO("KeInitAmd64SpecificState triggered #DE");
-        LOG_INFO("Skipping main PatchGuard initialization.");
-        isKeInitAmd64SpecificStateCalled = TRUE;
-        AdvanceGuestInstructionPointer(GuestContext);
-        goto Exit;
+    default:
+        MV_PANIC();
     }
-
-    //
-    // Otherwise, just forward the exception.
-    //
-    InjectInterruption(interruptInfo.InterruptionType, interruptInfo.Vector, FALSE, 0);
-
-Exit:
-    return;
 }
 
 /*!
@@ -728,6 +771,49 @@ HandleStartupIpi (
 }
 
 /*!
+    @brief Handles VM-exit due to NMI window exit.
+
+    @details This injects NMI to the guest based on the assumption that observing
+        NMI-window exiting means the host received NMI either during the root mode
+        via IDT or non-root mode via VM-exit, and the host enabled NMI-window
+        exiting without injecting NMI at that time.
+
+    @param[in,out] GuestContext - The pointer to the guest context.
+ */
+static
+VOID
+HandleNmiWindow (
+    _Inout_ GUEST_CONTEXT* GuestContext
+    )
+{
+    UNREFERENCED_PARAMETER(GuestContext);
+
+    SetNmiWindowExiting(FALSE);
+    InjectInterruption(NonMaskableInterrupt, Nmi, FALSE, 0);
+}
+
+/*!
+    @brief Handles VM-exit due to execution of the HLT instruction.
+
+    @details This hypervisor does not enable HLT exiting and should not receive
+        this VM-exit, unless it is running on Hyper-V. This is a workaround to
+        make this hypervisor work inside the Hyper-V VM.
+
+    @param[in,out] GuestContext - The pointer to the guest context.
+ */
+static
+VOID
+HandleHalt (
+    _Inout_ GUEST_CONTEXT* GuestContext
+    )
+{
+    //
+    // Ignore HLT.
+    //
+    AdvanceGuestInstructionPointer(GuestContext);
+}
+
+/*!
     @brief Handles VM-exit. This is the C-level entry point of the hypervisor.
 
     @details This function is called the actual entry point of hypervisor, the
@@ -817,8 +903,16 @@ HandleVmExit (
             HandleStartupIpi(&guestContext);
             break;
 
+        case VMX_EXIT_REASON_NMI_WINDOW:
+            HandleNmiWindow(&guestContext);
+            break;
+
         case VMX_EXIT_REASON_EXECUTE_CPUID:
             HandleCpuid(&guestContext);
+            break;
+
+        case VMX_EXIT_REASON_EXECUTE_HLT:
+            HandleHalt(&guestContext);
             break;
 
         case VMX_EXIT_REASON_EXECUTE_VMCALL:
@@ -917,6 +1011,16 @@ HandleHostException (
     _In_ CONST EXCEPTION_STACK* Stack
     )
 {
+    //
+    // Enable NMI-window exiting if NMI occurred during VMX root mode so that
+    // we can re-inject it when possible.
+    //
+    if (Stack->InterruptNumber == Nmi)
+    {
+        SetNmiWindowExiting(TRUE);
+        return;
+    }
+
     DumpGuestState();
     DumpHostState();
     DumpControl();

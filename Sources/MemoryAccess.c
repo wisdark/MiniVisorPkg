@@ -50,13 +50,13 @@ Split2MbPage (
     // all entries in the PT.
     //
     PdeLarge->LargePage = FALSE;
-    __stosq((UINT64*)pt, PdeLarge->Flags, PT_ENTRY_COUNT);
+    __stosq((UINT64*)pt, PdeLarge->Flags, PTE_ENTRY_COUNT_64);
 
     //
     // Update the page frame of each PTE.
     //
     paBase = (PdeLarge->PageFrameNumber << PAGE_SHIFT_2BM);
-    for (UINT32 ptIndex = 0; ptIndex < PT_ENTRY_COUNT; ++ptIndex)
+    for (UINT32 ptIndex = 0; ptIndex < PTE_ENTRY_COUNT_64; ++ptIndex)
     {
         paToMap = paBase + ((UINT64)ptIndex * PAGE_SIZE);
         pt[ptIndex].PageFrameNumber = (paToMap >> PAGE_SHIFT);
@@ -552,7 +552,6 @@ ReadOrWriteGuestVirtualAddress (
 {
     BOOLEAN successful;
     UINT64 physicalAddress;
-    VOID* failedVa;
     UINT64 guestVaToOperate;
     UINT8* currentBuffer;
     UINT64 remainingBytesToCopy;
@@ -577,7 +576,6 @@ ReadOrWriteGuestVirtualAddress (
     // As this lets the guest to execute the #PF handler and there is a relatively
     // larger window that allows other core to modify the 2nd page meanwhile.
     //
-    failedVa = NULL;
     currentBuffer = Buffer;
     guestVaToOperate = GuestVirtualAddress;
     remainingBytesToCopy = BytesToCopy;
